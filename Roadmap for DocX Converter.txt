@@ -1,0 +1,48 @@
+Roadmap for DocX Converter
+Phase 0 – Bootstrap
+poetry init → add python-docx, docxtpl, docx2python, pandas, typer, pytest.
+
+Drop modern_template.docx into template/.
+
+Phase 1 – Sample Audit
+Place 8‑heading and 7‑heading originals in samples/.
+
+Write inventory.py that loops files and prints every line matching the regex above to confirm pattern coverage.
+
+Phase 2 – Parser (MVP)
+Load: doc = docx.Document(path).
+
+Iterate paragraphs; apply regex; whenever a heading match occurs, start a new section blob.
+
+Store {num:str, text:str, level:int, body:list[Paragraph|Table]}.
+
+Phase 3 – Revision‑History Normalizer
+If paragraph._element.getparent().tag.endswith('tbl') → convert to DataFrame, df.drop(col_to_omit, axis=1).
+
+Else parse free‑text dates/notes with another regex.
+
+Phase 4 – Template Population
+Open modern_template.docx with docxtpl or plain python-docx.
+
+For each parsed section:
+
+tpl.add_heading(h.text, level=h.level)
+
+copy paragraph runs, preserving bold/italic.
+
+Insert revision‑history block (table or paragraphs).
+
+Phase 5 – CLI
+bash
+Copy
+Edit
+modernize  input_dir/  output_dir/  --log logs.txt --workers 4
+Typer autogenerates --help. 
+GitHub
+
+Phase 6 – GUI (later)
+Copy the minimal PySimpleGUI window from the docx‑converter repo; replace the core function with your CLI’s main() so both share code. 
+GitHub
+
+Phase 7 – Packaging
+Follow the PyInstaller example: pyinstaller --onefile --noconsole gui_app.py. 
