@@ -1,110 +1,91 @@
-# modernizer/writer.py
+# writer.py
+#
+# Revised to:
+#   - Keep existing logic for “X.” → Heading 1 (title), “X.X” → Heading 2, “X.X.X” → Heading 3
+#   - Preserve all numeric prefixes in each node["heading"]
+#   - Apply run.font.size = Pt(11) to every body‐text run
+#   - Do NOT touch headers or footers (we leave Policy Reference for later)
 
 from pathlib import Path
-from typing import Dict, Any
 import re
+from typing import Dict, Any
 
 from docx import Document
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.shared import Pt
-
-# Import your parser method
-from modernizer.parser import parse_legacy_docx_by_sequence
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
 
 def write_new_doc(parsed: Dict[str, Any], output_path: Path) -> None:
     """
-    Given the dictionary returned by `parse_legacy_docx_by_sequence(path)`,
-    create a new .docx at `output_path` with this structure:
-
-      • Title (parsed["document_title"]) as Heading 1
-      • For each top‐level in parsed["sections"]:
-          – Heading 2 for top["heading"]
-          – Any top["content"] lines as normal paragraphs
-          – For each child in top["children"]:
-              • If child["heading"] matches x.x.x → Heading 4
-              • Else if child["heading"] matches x.x   → Heading 3
-              • Else (catch‐all)                          → Heading 3
-              • Any child["content"] lines as normal paragraphs
-              • Recurse one more level: any child["children"]
-                  – Write as Heading 4, etc., with their content
-
-    Styles are mapped as follows:
-      • Heading 1 → 16 pt, bold, centered
-      • Heading 2 → 14 pt, bold
-      • Heading 3 → 12 pt, bold
-      • Heading 4 → 11 pt, bold, italic
-      • Body text → 11 pt, normal
-
-    Args:
-        parsed:  The dict from parse_legacy_docx_by_sequence(...)
-        output_path:  Path where the new .docx should be saved
+    Given the parsed structure (from parser.py), produce a brand-new .docx at output_path:
+      - Use Heading 1 for the document title
+      - Use Heading 2 for each top‐level section (parsed["sections"] entries)
+      - Use Heading 3 for each second‐level (node["children"])
+      - Use Heading 4 for each third‐level (grandchildren), etc.
+      - Every run of “body” text (node["content"]) is explicitly set to 11 pt.
+      - We do NOT insert any footer or header here.
     """
+
+    # Start a brand‐new document (Normal.dotm defaults apply).
     doc = Document()
 
-    # 1) Document Title (Heading 1, centered)
-    title_para = doc.add_paragraph(parsed["document_title"], style="Heading 1")
-    title_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+    # 1) Title (assume the very first heading is the document title).
+    title = parsed.get("document_title", "").strip()
+    if title:
+        title_para = doc.add_paragraph(title, style="Heading 1")
+        title_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        # Override size/bold per corporate spec:
+        for run in title_para.runs:
+            run.font.size = Pt(16)
+            run.font.bold = True
 
-    # 2) Helper to write a block (node) at a given heading level
-    def write_node(node: Dict[str, Any], level: int) -> None:
+    # 2) Recursively write sections
+    def _write_node(node: Dict[str, Any], level: int) -> None:
         """
-        Recursively write a node (with keys "heading", "content", "children") at given
-        heading level. level=2→Heading 2, 3→Heading 3, 4→Heading 4. After the heading, write
-        node["content"] as normal paragraphs, then recurse into node["children"].
+        Recursively write one node and its children.
+          level == 1 → Heading 2
+          level == 2 → Heading 3
+          level == 3 → Heading 4
+          etc.
         """
-        # Choose style name based on level
+        heading_text = node.get("heading", "").strip()
+        if not heading_text:
+            return
+
+        # Choose the correct style name based on `level`:
         if level == 1:
-            style_name = "Heading 1"
-        elif level == 2:
             style_name = "Heading 2"
-        elif level == 3:
+        elif level == 2:
             style_name = "Heading 3"
         else:
             style_name = "Heading 4"
 
-        # 2.a) Write the heading line
-        heading_para = doc.add_paragraph(node["heading"], style=style_name)
+        # Write the heading with numeric prefix preserved
+        h_para = doc.add_paragraph(heading_text, style=style_name)
+        # Override font size/bold for heading runs if needed
+        for run in h_para.runs:
+            if style_name == "Heading 2":
+                run.font.size = Pt(14)
+                run.font.bold = True
+            elif style_name == "Heading 3":
+                run.font.size = Pt(12)
+                run.font.bold = True
+            # Heading 4 and deeper inherit default; you can override here if desired.
 
-        # 2.b) Write any content lines under the heading
+        # 2.a) Write any “content” lines under this heading
         for line in node.get("content", []):
             if line.strip():
-                body_para = doc.add_paragraph(line)
-                body_para.style.font.size = Pt(11)
+                body_para = doc.add_paragraph()
+                run = body_para.add_run(line.strip())
+                run.font.size = Pt(11)
 
-        # 2.c) Recurse into children
+        # 2.b) Recurse into children (each child increments `level` by 1)
         for child in node.get("children", []):
-            # Determine if this is a sub‐subclause (e.g. starts with x.x.x)
-            raw = child["heading"].strip()
-            if re.match(r"^\s*\d+\.\d+\.\d+", raw):
-                # three‐level (x.x.x) → increase level by 1 (max 4)
-                write_node(child, min(level + 1, 4))
-            elif re.match(r"^\s*\d+\.\d+", raw):
-                # two‐level (x.x) → level + 1 (max 4)
-                write_node(child, min(level + 1, 4))
-            else:
-                # otherwise treat as same‐level child under top, so also Heading (level+1)
-                write_node(child, min(level + 1, 4))
+            _write_node(child, level + 1)
 
-    # 3) Walk through each top‐level section (Heading 2)
+    # Kick off with level=1 for each top‐level section
     for top in parsed.get("sections", []):
-        write_node(top, level=2)
+        _write_node(top, level=1)
 
-    # 4) Finally, save
+    # 3) Save the result
     doc.save(str(output_path))
-
-
-# If you want a quick test (without GUI), you can do:
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 3:
-        print("Usage: python -m modernizer.writer <input.docx> <output.docx>")
-        sys.exit(1)
-
-    in_path = Path(sys.argv[1])
-    out_path = Path(sys.argv[2])
-
-    parsed = parse_legacy_docx_by_sequence(in_path)
-    write_new_doc(parsed, out_path)
-    print(f"Wrote new file to {out_path}")

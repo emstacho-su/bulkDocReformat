@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Ordered top‐level keywords (lowercase)
 TOP_LEVEL_SEQUENCE = [
-    "purpose",
+    "purpose",  # only used for ordering, but we now handle it specially
     "scope",
     "definitions",
     "process owner",
@@ -27,7 +27,7 @@ TOP_LEVEL_SEQUENCE = [
 # Regex to strip any leading numeric prefix (e.g. "2.", "3.1", "4.")
 NUM_PREFIX_PATTERN = re.compile(r"^[\d\.]+\s*(.*)$")
 
-# Regex to match subclause pattern "x.x" (e.g. "4.1", "5.2", "6.3.1")
+# Regex to match subclause pattern "x.x" (e.g. "4.1", "5.2", "6.3")
 SUBCLAUSE_PATTERN = re.compile(r"^\s*\d+\.\d+")
 
 # Regex to match sub‐subclause pattern "x.x.x" (e.g. "4.1.1", "5.2.3")
@@ -36,8 +36,8 @@ SUBSUBCLAUSE_PATTERN = re.compile(r"^\s*\d+\.\d+\.\d+")
 # Regex to match single‐level prefix "7. Something" but not "7.1"
 SINGLE_LEVEL_PATTERN = re.compile(r"^(\d+)\.\s+")
 
-# Case‐insensitive match for "process owner"
-PROCESS_OWNER_PATTERN = re.compile(r"process\s+owner", re.IGNORECASE)
+# Case‐insensitive match for “purpose and scope”
+PURPOSE_AND_SCOPE_PATTERN = re.compile(r"^purpose\s+and\s+scope", re.IGNORECASE)
 
 # Case‐insensitive match for lines beginning with "process designee"
 PROCESS_DESIGNEE_PATTERN = re.compile(r"^process\s+designee", re.IGNORECASE)
@@ -75,31 +75,32 @@ def strip_numeric_prefix(text: str) -> str:
 
 def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
     """
-    Parses a legacy .docx with the following rules:
+    Parses a legacy .docx with these adjustments:
+    
+    1) Everything from immediately after “1. Purpose and Scope” up to “2. Definitions”
+       is gathered into a single block.  We then split that block on the first
+       occurrence of “Scope” (case‐insensitive) so that:
+         - purpose_text = lines between “PURPOSE” and “SCOPE”
+         - scope_text   = lines between “SCOPE” and “2. Definitions”
+       These two strings are returned separately as `purpose_text` and `scope_text`.
+    
+    2) From “2. Definitions” onward, parsing proceeds as before––extracting top‐levels
+       (Definitions, Process Owner, etc.), subclauses, sub‐subclauses, and finally
+       revision history.
 
-    1. A paragraph starting with a single‐level numeric prefix (e.g. "7. Policy References",
-       "8. Revisions…") → new top‐level node, provided we are not inside a subclause.
-    2. Otherwise, if a paragraph’s stripped remainder begins with the next keyword in
-       TOP_LEVEL_SEQUENCE, it becomes that top‐level node.
-    3. If “definitions” never appears, but a bold “Term: Definition” or a subclause shows up,
-       create a synthetic "2. Definitions" top‐level.
-    4. Inside “Definitions,” a paragraph containing “:” → new child. A paragraph without “:”
-       immediately following is appended onto the previous child’s heading (continuation).
-    5. “Process Owner” → next non‐empty paragraph becomes the **single child** under “Process Owner.”
-    6. “Process Designee” → new top‐level; all following lines (until next top‐level or “Procedures”)
-       get lumped as one child under “Process Designee.”
-    7. A line matching “x.x.x …” (three‐level numeric) → a **sub‐subclause** under the active
-       `current_sub` (if `current_sub` exists). That sub‐subclause becomes `current_subsub`.
-    8. A line matching “x.x …” (two‐level numeric) → a **subclause** under the active top‐level.
-        - This resets `current_subsub = None`.
-    9. Once inside a subclause (or sub‐subclause), any further bold text → appended as content to
-       the deepest active node (i.e. `current_subsub` if exists, else `current_sub`).
-   10. Any other bold line (when not capturing Process Owner/Designee) → a new subclause under
-       the current top‐level (unless a subclause is open).
-   11. Non‐bold lines attach as content under the deepest active node (`current_subsub` → `current_sub` → `current_top`).
-   12. Finally, extract revision history via a trailing table, or treat leftover text as a
-       written revision block.
+    3) Under “Records,” we force bold lines to attach as content, never as subclauses.
+
+    Returns a dict containing:
+      {
+        "document_title": str,
+        "purpose_text": str,
+        "scope_text": str,
+        "sections": [...],         # parsed from “2. Definitions” onward
+        "revision_history": {...}
+      }
     """
+
+    # (A) Load document and collect all non‐empty paragraphs
     try:
         doc = Document(path)
     except Exception as e:
@@ -109,9 +110,15 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
     paras = [p for p in doc.paragraphs if p.text.strip()]
     if not paras:
         logger.warning(f"No paragraphs found in {path.name}")
-        return {"document_title": "", "sections": [], "revision_history": {"type": "written", "content": []}}
+        return {
+            "document_title": "",
+            "purpose_text": "",
+            "scope_text": "",
+            "sections": [],
+            "revision_history": {"type": "written", "content": []}
+        }
 
-    # (1) Document title = first bold paragraph if present, else first paragraph
+    # (B) Determine Document Title = first bold paragraph, or fallback to first
     document_title = ""
     for p in paras:
         if any(run.bold for run in p.runs):
@@ -123,29 +130,91 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
 
     logger.info(f"[{path.name}] Document Title: {document_title!r}")
 
+    # (C) Locate the indices of “1. Purpose and Scope” and “2. Definitions”
+    idx_purpose_scope = None
+    idx_definitions = None
+    for idx, p in enumerate(paras):
+        raw = p.text.strip()
+        stripped = strip_numeric_prefix(raw)
+        low = normalize(stripped)
+
+        # Find “1. Purpose and Scope”
+        if idx_purpose_scope is None:
+            if SINGLE_LEVEL_PATTERN.match(raw):
+                # If strip_numeric_prefix(raw) starts with "Purpose and Scope"
+                if PURPOSE_AND_SCOPE_PATTERN.match(stripped):
+                    idx_purpose_scope = idx
+                    continue
+
+        # Once we have idx_purpose_scope, find “2. Definitions”
+        if idx_purpose_scope is not None and idx_definitions is None:
+            if SINGLE_LEVEL_PATTERN.match(raw):
+                # If strip_numeric_prefix(raw) starts with "Definitions"
+                if low.startswith("definitions"):
+                    idx_definitions = idx
+                    break
+
+    # If we never found “1. Purpose and Scope,” fall back to normal parsing
+    if idx_purpose_scope is None or idx_definitions is None:
+        logger.warning("Could not locate both '1. Purpose and Scope' and '2. Definitions'. "
+                       "Skipping special-purpose handling.")
+        idx_purpose_scope = None
+        idx_definitions = None
+
+    # (D) Extract purpose_block and scope_block if we have both indices
+    purpose_text = ""
+    scope_text = ""
+    start_idx = (idx_purpose_scope + 1) if idx_purpose_scope is not None else None
+    if start_idx is not None:
+        block_paras = [p.text.strip() for p in paras[start_idx:idx_definitions]]
+        # Find the split index where “Scope” appears
+        split_idx = None
+        for i, line in enumerate(block_paras):
+            # normalized word starts with “scope”
+            if normalize(strip_numeric_prefix(line)).startswith("scope"):
+                split_idx = i
+                break
+
+        # If we found “SCOPE” somewhere
+        if split_idx is not None:
+            # Everything from after the bold “PURPOSE” line up to before “SCOPE”
+            purpose_lines = []
+            for line in block_paras[:split_idx]:
+                # skip any leading “PURPOSE” label
+                if normalize(strip_numeric_prefix(line)).startswith("purpose"):
+                    continue
+                purpose_lines.append(line)
+            purpose_text = "\n".join(purpose_lines).strip()
+
+            # Everything after “SCOPE” label
+            scope_lines = []
+            for line in block_paras[split_idx + 1 :]:
+                scope_lines.append(line)
+            scope_text = "\n".join(scope_lines).strip()
+        else:
+            # If “SCOPE” keyword not found, everything goes into purpose_text
+            purpose_text = "\n".join(block_paras).strip()
+            scope_text = ""
+
+        logger.info(f"Extracted purpose_text: {purpose_text!r}")
+        logger.info(f"Extracted scope_text:   {scope_text!r}")
+
+    # (E) Now parse from “2. Definitions” onward
+    remaining_paras = paras[idx_definitions:] if idx_definitions is not None else paras[:]
+
+    # Redefine local lists for the remainder
     sections: List[Dict[str, Any]] = []
     current_top: Dict[str, Any] = None
     current_sub: Dict[str, Any] = None
     current_subsub: Dict[str, Any] = None
-    next_top_idx = 0  # index into TOP_LEVEL_SEQUENCE
+    next_top_idx = 2  # We have effectively consumed “purpose” and “scope” indices
 
-    # Flags for capturing “Process Owner” child
     expect_owner_child = False
-
-    # Flags for capturing “Process Designee” block
     capturing_designee_block = False
-    designee_lines: List[str] = []
+    designee_buffer: List[str] = []
 
     def create_top(heading: str, forced_keyword: str = None) -> None:
-        """
-        Create a new top‐level node with "heading". If forced_keyword is provided,
-        advance next_top_idx to that keyword’s index+1. Otherwise, if stripped remainder
-        matches TOP_LEVEL_SEQUENCE[next_top_idx], advance by 1.
-
-        Reset current_sub and current_subsub.
-        """
-        nonlocal sections, current_top, current_sub, current_subsub
-        nonlocal next_top_idx, expect_owner_child, capturing_designee_block, designee_lines
+        nonlocal sections, current_top, current_sub, current_subsub, next_top_idx, expect_owner_child, capturing_designee_block, designee_buffer
 
         node = {"heading": heading, "content": [], "children": []}
         sections.append(node)
@@ -154,7 +223,7 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
         current_subsub = None
         expect_owner_child = False
         capturing_designee_block = False
-        designee_lines = []
+        designee_buffer = []
 
         if forced_keyword:
             try:
@@ -167,8 +236,11 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
             if next_top_idx < len(TOP_LEVEL_SEQUENCE) and rem.startswith(TOP_LEVEL_SEQUENCE[next_top_idx]):
                 next_top_idx += 1
 
-    # (2) Iterate through all non‐empty paragraphs
-    for p in paras:
+    # (F) Iterate through “remaining_paras” exactly as before, with two exceptions:
+    #     1) “Records” never spawns subclauses
+    #     2) Multi‐line “Process Designee”
+    #
+    for p in remaining_paras:
         text = p.text.strip()
         if not text:
             continue
@@ -178,36 +250,47 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
         raw = text.strip()
         is_bold = any(run.bold for run in p.runs)
 
-        # ----- A) If capturing a Designee block, collect lines until a top‐level or subclause appears -----
+        # 1) If capturing a Designee block, gather until next real top or subclause
         if capturing_designee_block:
-            # If this paragraph signals “Procedures” (next keyword) or a single‐level numeric prefix
-            # (and we’re NOT inside a subclause), flush designee_lines and re‐process:
-            if (low.startswith("procedures")
-                   and next_top_idx < len(TOP_LEVEL_SEQUENCE)
-                   and TOP_LEVEL_SEQUENCE[next_top_idx] == "procedures") \
-               or (current_sub is None and SINGLE_LEVEL_PATTERN.match(raw) and not SUBCLAUSE_PATTERN.match(raw)):
-                child_heading = "\n".join(designee_lines).strip()
-                if child_heading:
-                    child = {"heading": child_heading, "content": [], "children": []}
-                    current_top["children"].append(child)
-                designee_lines = []
+            is_new_top = (
+                current_sub is None
+                and SINGLE_LEVEL_PATTERN.match(raw)
+                and not SUBCLAUSE_PATTERN.match(raw)
+            ) or (
+                next_top_idx < len(TOP_LEVEL_SEQUENCE)
+                and low.startswith(TOP_LEVEL_SEQUENCE[next_top_idx])
+            )
+            is_procedures = (
+                low.startswith("procedures")
+                and next_top_idx < len(TOP_LEVEL_SEQUENCE)
+                and TOP_LEVEL_SEQUENCE[next_top_idx] == "procedures"
+            )
+            if is_new_top or is_procedures:
+                # Flush buffered names
+                for name_line in designee_buffer:
+                    for token in re.split(r"\s*,\s*", name_line):
+                        token = token.strip()
+                        if token:
+                            child = {"heading": token, "content": [], "children": []}
+                            current_top["children"].append(child)
+                designee_buffer = []
                 capturing_designee_block = False
-                # fall through to re‐process this paragraph as top‐level or subclause
+                # fall through to re‐process this paragraph
             else:
-                designee_lines.append(text)
+                designee_buffer.append(text)
                 continue
 
-        # ----- B) SINGLE‐LEVEL numeric prefix → NEW TOP-LEVEL (only if NOT inside a subclause) -----
+        # 2) SINGLE‐LEVEL numeric prefix → NEW TOP (unless “1. Purpose and Scope,” but now we’re at “2. Definitions” onward)
         if current_sub is None and SINGLE_LEVEL_PATTERN.match(raw) and not SUBCLAUSE_PATTERN.match(raw):
+            # At this point, “2. Definitions” should match and create a top node
             create_top(text)
             continue
 
-        # ----- C) TOP-LEVEL keyword in sequence -----
+        # 3) TOP‐LEVEL keyword in sequence (e.g. “Definitions,” “Process Owner,” etc.)
         if next_top_idx < len(TOP_LEVEL_SEQUENCE):
             expected = TOP_LEVEL_SEQUENCE[next_top_idx]
             if low.startswith(expected):
-                # If it’s “process designee,” go to block E instead
-                if low.startswith("process designee"):
+                if PROCESS_DESIGNEE_PATTERN.match(low):
                     pass
                 else:
                     create_top(text)
@@ -215,7 +298,7 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
                         expect_owner_child = True
                     continue
 
-        # ----- D) PROCESS OWNER: next non‐empty paragraph is its single child -----
+        # 4) PROCESS OWNER → next non‐empty paragraph is its single child
         if expect_owner_child:
             child = {"heading": text, "content": [], "children": []}
             current_top["children"].append(child)
@@ -224,46 +307,60 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
             expect_owner_child = False
             continue
 
-        # ----- E) PROCESS DESIGNEE: new top‐level; collect subsequent lines in one block -----
-        if low.startswith("process designee"):
-            create_top(text)
+        # 5) PROCESS DESIGNEE: build multi‐line children
+        if PROCESS_DESIGNEE_PATTERN.match(low):
+            create_top("Process Designees")
+            if ":" in stripped:
+                after = stripped.split(":", 1)[1].strip()
+                if after:
+                    designee_buffer.append(after)
             capturing_designee_block = True
-            designee_lines = []
             continue
 
-        # ----- F) “DEFINITIONS” section: paragraphs with “:” → new child; others append to last child -----
-        if current_top and normalize(strip_numeric_prefix(current_top["heading"])).startswith("definitions"):
-            # Check if would actually be a new top‐level (“Procedures” or single‐level numeric):
-            is_new_top = (current_sub is None and SINGLE_LEVEL_PATTERN.match(raw) and not SUBCLAUSE_PATTERN.match(raw)) \
-                         or (next_top_idx < len(TOP_LEVEL_SEQUENCE) and low.startswith(TOP_LEVEL_SEQUENCE[next_top_idx]))
+        # 6) “DEFINITIONS” section:
+        if (
+            current_top
+            and normalize(strip_numeric_prefix(current_top["heading"])).startswith("definitions")
+        ):
+            is_new_top = (
+                current_sub is None
+                and SINGLE_LEVEL_PATTERN.match(raw)
+                and not SUBCLAUSE_PATTERN.match(raw)
+            ) or (
+                next_top_idx < len(TOP_LEVEL_SEQUENCE)
+                and low.startswith(TOP_LEVEL_SEQUENCE[next_top_idx])
+            )
             if not is_new_top:
-                # If this paragraph CONTAINS a colon → start a BRAND‐NEW definition child
                 if ":" in text:
                     child = {"heading": text, "content": [], "children": []}
                     current_top["children"].append(child)
                     current_sub = child
                     current_subsub = None
                 else:
-                    # continuation of the previous definition: append onto its heading
                     if current_sub:
                         current_sub["heading"] += " " + text
                     else:
-                        # If somehow no current_sub, just treat as a new child
                         child = {"heading": text, "content": [], "children": []}
                         current_top["children"].append(child)
                         current_sub = child
                         current_subsub = None
                 continue
 
-        # ----- G) SUB-SUBCLAUSE detection "x.x.x" → new node under current_sub (if exists) -----
-        if SUBSUBCLAUSE_PATTERN.match(raw) and current_sub:
+        # 7) SUB‐SUBCLAUSE “x.x.x” (only if bold, and not under “Records”)
+        if is_bold and SUBSUBCLAUSE_PATTERN.match(raw) and current_sub:
             child = {"heading": text, "content": [], "children": []}
             current_sub["children"].append(child)
             current_subsub = child
             continue
 
-        # ----- H) SUBCLAUSE detection "x.x" → new node under current_top (resets sub-sub) -----
-        if SUBCLAUSE_PATTERN.match(raw):
+        # 8) SUBCLAUSE “x.x” (only if bold; under “Records,” attach as content)
+        if is_bold and SUBCLAUSE_PATTERN.match(raw):
+            if (
+                current_top
+                and normalize(strip_numeric_prefix(current_top["heading"])) == "records"
+            ):
+                current_top["content"].append(text)
+                continue
             if current_top:
                 child = {"heading": text, "content": [], "children": []}
                 current_top["children"].append(child)
@@ -271,17 +368,20 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
                 current_subsub = None
             continue
 
-        # ----- I) Any other bold (outside Process Owner/Designee) → new subclause if not inside one -----
+        # 9) Any other bold:
         if is_bold:
-            # If inside sub‐subclause, append to its content
+            if (
+                current_top
+                and normalize(strip_numeric_prefix(current_top["heading"])) == "records"
+            ):
+                current_top["content"].append(text)
+                continue
             if current_subsub:
                 current_subsub["content"].append(text)
                 continue
-            # If inside subclause, append to its content
             if current_sub:
                 current_sub["content"].append(text)
                 continue
-            # Otherwise, create a new subclause under current_top
             if current_top:
                 child = {"heading": text, "content": [], "children": []}
                 current_top["children"].append(child)
@@ -289,7 +389,7 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
                 current_subsub = None
             continue
 
-        # ----- J) Non‐bold → attach to deepest active node (sub‐sub → sub → top) -----
+        # 10) Non‐bold → attach as content under the deepest active node
         if current_subsub:
             current_subsub["content"].append(text)
         elif current_sub:
@@ -297,17 +397,21 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
         elif current_top:
             current_top["content"].append(text)
         else:
-            # No parent → skip
+            # No parent
             pass
 
-    # (3) Flush any remaining designee_lines
-    if capturing_designee_block and current_top and designee_lines:
-        child_heading = "\n".join(designee_lines).strip()
-        if child_heading:
-            child = {"heading": child_heading, "content": [], "children": []}
-            current_top["children"].append(child)
+    # (G) Flush any remaining designee_buffer
+    if capturing_designee_block and current_top and designee_buffer:
+        for name_line in designee_buffer:
+            for token in re.split(r"\s*,\s*", name_line):
+                token = token.strip()
+                if token:
+                    child = {"heading": token, "content": [], "children": []}
+                    current_top["children"].append(child)
+        designee_buffer = []
+        capturing_designee_block = False
 
-    # (4) Extract revision history
+    # (H) Extract revision history
     rev_hist = extract_revision_history(doc)
     if rev_hist["type"] == "table":
         if current_subsub:
@@ -316,9 +420,14 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
             current_sub["content"] = []
         elif current_top:
             current_top["content"] = []
-        return {"document_title": document_title, "sections": sections, "revision_history": rev_hist}
+        return {
+            "document_title": document_title,
+            "purpose_text": purpose_text,
+            "scope_text": scope_text,
+            "sections": sections,
+            "revision_history": rev_hist
+        }
 
-    # (5) Otherwise, leftover content is written revision history
     if current_subsub:
         written = {"type": "written", "content": current_subsub["content"]}
         current_subsub["content"] = []
@@ -331,4 +440,10 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
     else:
         written = {"type": "written", "content": []}
 
-    return {"document_title": document_title, "sections": sections, "revision_history": written}
+    return {
+        "document_title": document_title,
+        "purpose_text": purpose_text,
+        "scope_text": scope_text,
+        "sections": sections,
+        "revision_history": written
+    }
