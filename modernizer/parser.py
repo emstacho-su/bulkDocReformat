@@ -121,16 +121,26 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
     next_top_idx = 2  # 'purpose' and 'scope' consumed logically
 
     expect_owner_child = False
+    capturing_owner_block = False
+    owner_buffer: List[str] = []
     capturing_designee_block = False
     designee_buffer: List[str] = []
 
+
     def create_top(heading: str):
         nonlocal sections, current_top, current_sub, current_subsub
-        nonlocal next_top_idx, expect_owner_child, capturing_designee_block, designee_buffer
+        nonlocal next_top_idx, expect_owner_child
+        nonlocal capturing_owner_block, owner_buffer, capturing_designee_block, designee_buffer
+
         node = {"heading": heading, "content": [], "children": []}
         sections.append(node)
         current_top, current_sub, current_subsub = node, None, None
-        expect_owner_child = capturing_designee_block = False
+
+        # Reset any in‐progress owner/designee capture whenever we start a fresh top
+        expect_owner_child = False
+        capturing_owner_block = False
+        owner_buffer = []
+        capturing_designee_block = False
         designee_buffer = []
 
         stripped_head = normalize(strip_numeric_prefix(heading))
@@ -138,6 +148,7 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
             TOP_LEVEL_SEQUENCE[next_top_idx]
         ):
             next_top_idx += 1
+
 
     for p in remaining:
         text = p.text.strip()
@@ -150,10 +161,34 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
         is_bold = any(run.bold for run in p.runs)
 
         # ------------------------------------------------------------------
-        #  Special case: bold "Records" without numeric prefix
-        # ------------------------------------------------------------------
-        if is_bold and low == "records":
+        #  Special case: promote *any* "Records" heading to a new top
+        #  – ignores bold state and punctuation, but still protects against
+        #    accidental matches inside body text by requiring either
+        #    (a) bold‑face OR (b) a single‑level numeric prefix like "6."+      # ------------------------------------------------------------------        if (
+        if(
+            low.startswith("records")                # "records", "records:", "records –"
+            and (is_bold or SINGLE_LEVEL_PATTERN.match(raw))
+        ):
             create_top(text)
+            continue
+        
+        # ------------------------------------------------------------------
+        #  Special case: promote *any* "Policy Reference" heading to a new top
+        #  – ignores bold state and punctuation, but still protects against
+        #    accidental matches inside body text by requiring either
+        #    (a) bold-face OR (b) a single-level numeric prefix like "7."
+        # ------------------------------------------------------------------
+        if (
+            low.startswith("policy reference")       # “Policy Reference”, “Policy Reference:”, etc.
+            and (is_bold or SINGLE_LEVEL_PATTERN.match(raw))
+        ):
+            create_top(text)
+            continue
+                # ------------------------------------------------------------------
+        #  Special case: skip any "Revision History" heading or line entirely
+        #  – prevents “Revision History …” from becoming content under any section
+        # ------------------------------------------------------------------
+        if low.startswith("revision history"):
             continue
 
         # ------------------------------------------------------------------
@@ -182,14 +217,59 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
                 continue
 
         # ------------------------------------------------------------------
-        #  Single‑level numeric prefix → new top
+        #  Single-level numeric prefix → new top (including “Process Owner”)
         # ------------------------------------------------------------------
         if SINGLE_LEVEL_PATTERN.match(raw) and not SUBCLAUSE_PATTERN.match(raw):
-
+            stripped_head = normalize(strip_numeric_prefix(text))
             create_top(text)
-            if normalize(strip_numeric_prefix(text)).startswith("process owner"):
-                expect_owner_child = True
+
+            # If this is “Process Owner”, begin capturing all following owner lines
+            if stripped_head.startswith("process owner"):
+                capturing_owner_block = True
+                owner_buffer = []
+            else:
+                # Any other top resets both owner/designee state
+                capturing_owner_block = False
+                owner_buffer = []
+                capturing_designee_block = False
+                designee_buffer = []
+
             continue
+
+        # ------------------------------------------------------------------
+        #  If we’re in the middle of collecting Process Owner lines
+        # ------------------------------------------------------------------
+        if capturing_owner_block:
+            # Determine if this paragraph starts a new top (e.g. “4. Procedures”) or “Process Designees:”
+            is_new_top = (
+                SINGLE_LEVEL_PATTERN.match(raw) and not SUBCLAUSE_PATTERN.match(raw)
+            ) or (
+                next_top_idx < len(TOP_LEVEL_SEQUENCE)
+                and low.startswith(TOP_LEVEL_SEQUENCE[next_top_idx])
+            )
+
+            # Explicitly treat “Process Designees:” as a top‐breaker, too
+            if PROCESS_DESIGNEE_PATTERN.match(stripped):
+                is_new_top = True
+
+            if is_new_top:
+                # Flush owner_buffer into child nodes under the “Process Owner” top
+                for line in owner_buffer:
+                    token = line.strip()
+                    if token:
+                        current_top["children"].append({
+                            "heading": token,
+                            "content": [],
+                            "children": []
+                        })
+                owner_buffer = []
+                capturing_owner_block = False
+                # Do NOT continue here, so that this same paragraph can be re‐evaluated
+                # (it may start “Process Designees:” or be a fresh top)
+            else:
+                # Still within “3. Process Owner” block → collect this line
+                owner_buffer.append(text)
+                continue
 
         # ------------------------------------------------------------------
         #  Keyword in sequence → new top
@@ -212,17 +292,21 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
             expect_owner_child = False
             continue
 
+               # ------------------------------------------------------------------
+        #  Process-Designee start (“Process Designees:” bold line)
         # ------------------------------------------------------------------
-        #  Process Designee start (“Process Designee:” bold line)
-        # ------------------------------------------------------------------
-        if PROCESS_DESIGNEE_PATTERN.match(low):
+        if PROCESS_DESIGNEE_PATTERN.match(stripped):
             create_top("Process Designees")
-            if ":" in stripped:
-                after = stripped.split(":", 1)[1].strip()
-                if after:
-                    designee_buffer.append(after)
             capturing_designee_block = True
+            designee_buffer = []
+
+            # If there’s text after the colon on the same line, capture it immediately
+            if ":" in stripped:
+                remainder = stripped.split(":", 1)[1].strip()
+                if remainder:
+                    designee_buffer.append(remainder)
             continue
+
 
         # ------------------------------------------------------------------
         #  DEFINITIONS: every bold line w/ colon is new child
@@ -331,6 +415,19 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
         elif current_top:
             current_top["content"].append(text)
 
+        # ------------------------------------------------------------------
+    #  Flush any buffered owners
+    # ------------------------------------------------------------------
+    if capturing_owner_block and current_top and owner_buffer:
+        for line in owner_buffer:
+            token = line.strip()
+            if token:
+                current_top["children"].append(
+                    {"heading": token, "content": [], "children": []}
+                )
+        owner_buffer = []
+        capturing_owner_block = False
+
     # ------------------------------------------------------------------
     #  Flush any buffered designees
     # ------------------------------------------------------------------
@@ -341,19 +438,23 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
                 current_top["children"].append(
                     {"heading": token, "content": [], "children": []}
                 )
-        # ------------------------------------------------------------------
-    
+        designee_buffer = []
+        capturing_designee_block = False
 
     # ------------------------------------------------------------------
     #  Revision history
     # ------------------------------------------------------------------
     rev_hist = extract_revision_history(doc)
     if rev_hist["type"] == "table":
-        if current_subsub:
+        # Only clear text that belongs to a *Revisions* heading
+        def _is_revision(node):
+            return node and "revision" in normalize(strip_numeric_prefix(node["heading"]))
+
+        if _is_revision(current_subsub):
             current_subsub["content"] = []
-        elif current_sub:
+        elif _is_revision(current_sub):
             current_sub["content"] = []
-        elif current_top:
+        elif _is_revision(current_top):
             current_top["content"] = []
         return {
             "document_title": document_title,
@@ -364,12 +465,18 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
 
     # Written rev history → attach to last node (cleared afterwards)
     written = {"type": "written", "content": []}
-    if current_subsub:
-        written["content"] = current_subsub["content"]; current_subsub["content"] = []
-    elif current_sub:
-        written["content"] = current_sub["content"]; current_sub["content"] = []
-    elif current_top:
-        written["content"] = current_top["content"]; current_top["content"] = []
+    def _is_revision(node):
+        return node and "revision" in normalize(strip_numeric_prefix(node["heading"]))
+
+    if _is_revision(current_subsub):
+        written["content"] = current_subsub["content"]
+        current_subsub["content"] = []
+    elif _is_revision(current_sub):
+        written["content"] = current_sub["content"]
+        current_sub["content"] = []
+    elif _is_revision(current_top):
+        written["content"] = current_top["content"]
+        current_top["content"] = []
 
     return {
         "document_title": document_title,
