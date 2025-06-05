@@ -11,7 +11,9 @@ from docx.text.paragraph import Paragraph
 from docx.shared import Inches
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-
+from docx.shared import Pt   # add next to your other imports
+from math import ceil
+from docx.shared import Pt
 # Import the parser
 from modernizer.parser import parse_legacy_docx_by_sequence
 
@@ -50,7 +52,7 @@ def _insert_paragraph_after(paragraph: Paragraph, text: str = "", style: str = N
         new_para.text = text
 
     if indent_level:
-        new_para.paragraph_format.left_indent = Inches(0.3 * indent_level)
+        new_para.paragraph_format.left_indent = Inches(0. * indent_level)
 
     return new_para
 
@@ -151,6 +153,64 @@ def insert_revision_history_table(doc: Document, rev_data: Dict[str, Any]) -> No
         new_row.cells[2].text = row[col_map["desc"]].strip()
         center_align_cell(new_row.cells[0])
         center_align_cell(new_row.cells[1])
+
+
+# ----------------------------------------------------------------------
+#  Pagination helper – shrink the Revision-History table *iff* the
+#  combined intro block barely overruns one page (cell-level counting).
+# ----------------------------------------------------------------------
+def _fit_intro_sections_to_page(doc: Document) -> None:
+    """
+    Count “lines” (estimating 80 chars per paragraph‐line, 40 chars per cell‐line)
+    from the first paragraph up to “Definitions”.  Shrink the Revision-History
+    table if total lines are between 47 and 70.
+    """
+    # 1) Find the first 'Definitions' paragraph
+    def_idx = next(
+        (i for i, p in enumerate(doc.paragraphs)
+         if p.text.strip().lower().startswith("definitions")), None
+    )
+    if def_idx is None:
+        return
+
+    # 2) Estimate lines: paragraphs first (80 chars/line), tables next
+    lines = 0
+    seen_tables = set()
+
+    for p in doc.paragraphs[:def_idx]:
+        if p._element.getparent().tag.endswith("tc"):
+            seen_tables.add(p._tc.table)
+            continue
+
+        txt = p.text.strip()
+        if txt:
+            lines += max(1, ceil(len(txt) / 80))
+
+    # --- START OF REPLACED BLOCK: count per cell instead of per row ---
+    for tbl in seen_tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                cell_txt = cell.text.strip()
+                if not cell_txt:
+                    continue
+                # Assume ~40 chars wrap per visible line inside a table cell
+                lines += max(1, ceil(len(cell_txt) / 40))
+    # --- END OF REPLACED BLOCK ---
+
+    # 3) Decide: ≤46 → fits; 47–70 → shrink; >70 → leave alone
+    if lines <= 38 or lines > 70:
+        return
+
+    # 4) Shrink only the Revision-History table
+    rev_tbl = _find_revision_table(doc)
+    if rev_tbl is None:
+        return
+
+    for row in rev_tbl.rows:
+        for cell in row.cells:
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.font.size = Pt(10)
 
 
 def populate_template(
@@ -305,6 +365,11 @@ def populate_template(
     p11.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
     cell11.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
     set_cell_border(cell11)
+
+    # ------------------------------------------------------------------
+    # -- Condense intro to one page if feasible ------------------------
+    # ------------------------------------------------------------------
+    _fit_intro_sections_to_page(doc)
 
     # ------------------------------------------------------------------
     # 4) DEFINITIONS
