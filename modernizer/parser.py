@@ -36,7 +36,7 @@ SUBSUBCLAUSE_PATTERN  = re.compile(r"^\s*\d+\.\d+\.\d+")
 SINGLE_LEVEL_PATTERN  = re.compile(r"^(\d+)\.\s+")
 PURPOSE_AND_SCOPE_PATTERN = re.compile(r"^purpose\s+and\s+scope", re.IGNORECASE)
 PROCESS_DESIGNEE_PATTERN  = re.compile(r"^process\s+designee", re.IGNORECASE)
-
+LETTERED_PATTERN      = re.compile(r"^[A-Za-z]\.\s+")
 # ---------------------------------------------------------------------
 #  Utility functions
 # ---------------------------------------------------------------------
@@ -184,7 +184,7 @@ def parse_legacy_docx_by_sequence(path: Path) -> Dict[str, Any]:
         ):
             create_top(text)
             continue
-                # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
         #  Special case: skip any "Revision History" heading or line entirely
         #  – prevents “Revision History …” from becoming content under any section
         # ------------------------------------------------------------------
